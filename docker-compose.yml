@@ -1,0 +1,107 @@
+# Sistema cliente-servidor del IoT Analytics Dashboard (NexoDev Solutions)
+name: iot-cliente-servidor
+
+services:
+  # ---------------- SERVIDOR DE BASE DE DATOS ----------------
+  postgres:
+    image: postgres:16
+    container_name: iot-servidor-bd
+    environment:
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-admin123}
+      POSTGRES_DB: iotanalytics
+    command: >
+      -c ssl=on
+      -c ssl_cert_file=/etc/ssl/certs/ssl-cert-snakeoil.pem
+      -c ssl_key_file=/etc/ssl/private/ssl-cert-snakeoil.key
+    ports:
+      - "5434:5432"          # 5434 en la PC para no chocar con otros PostgreSQL
+    volumes:
+      - ./servidor/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d iotanalytics"]
+      interval: 3s
+      retries: 10
+
+  # ---------------- INTERMEDIARIO DE MENSAJES ----------------
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    container_name: iot-rabbitmq
+    hostname: iot-rabbitmq   # nombre fijo del nodo de RabbitMQ
+    environment:
+      # La cookie de Erlang se pasa como argumento: así RabbitMQ no necesita leer
+      # /var/lib/rabbitmq/.erlang.cookie, que fallaba con "eacces" en Docker Desktop
+      RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS: "-setcookie iotanalyticscookie"
+    tmpfs:
+      - /var/lib/rabbitmq:mode=1777
+    ports:
+      - "5673:5672"          # AMQP
+      - "15673:15672"        # panel web: http://localhost:15673 (guest / guest)
+    healthcheck:
+      # Comprueba que el puerto AMQP acepte conexiones (no usa la cookie)
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/5672'"]
+      interval: 5s
+      retries: 30
+
+  # ---------------- CLIENTES ----------------
+  # Cliente 1: simula los sensores y publica lecturas en RabbitMQ
+  simulador:
+    build: ./clientes
+    image: iot-clientes:1.0
+    command: python simulador.py
+    environment:
+      MQ_HOST: rabbitmq
+      INTERVALO: "1"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+  # Cliente 2: consume la cola y guarda las lecturas en el servidor por lotes
+  consumidor:
+    build: ./clientes
+    image: iot-clientes:1.0
+    command: python consumidor.py
+    environment:
+      MQ_HOST: rabbitmq
+      DB_HOST: postgres
+      DB_USER: ingesta
+      DB_PASSWORD: ingesta123
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      simulador:
+        condition: service_started
+
+  # Cliente 3: consultas del operador (se ejecuta a demanda con docker compose run)
+  cliente:
+    build: ./clientes
+    image: iot-clientes:1.0
+    command: python cliente.py
+    environment:
+      DB_HOST: postgres
+      DB_USER: operador
+      DB_PASSWORD: operador123
+    stdin_open: true
+    tty: true
+    profiles: ["cliente"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # Cliente 4: Grafana, visualización (solo lectura)
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: iot-grafana
+    ports:
+      - "3001:3000"          # http://localhost:3001 (admin / admin)
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./grafana/dashboards:/var/lib/grafana/dashboards
+    depends_on:
+      postgres:
+        condition: service_healthy
